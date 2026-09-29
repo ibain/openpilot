@@ -1,0 +1,747 @@
+From b5b33cb0d0a3864fb8b5e285b4572637d950dec7 Mon Sep 17 00:00:00 2001
+From: Ian Bain <ibain@mac.com>
+Date: Mon, 28 Sep 2026 20:40:36 -0700
+Subject: [PATCH] Rivian: let MADS steering stay on when braking
+
+Rivian was a MADS limited brand, so every brake press ended steering
+no matter the setting. Drop it from that list so Remain Active/Pause
+apply, and give it real off switches since there is no MADS button:
+stalk up past the detent, shifting to P or R, or a fresh stalk-up
+press once speed control is already off. One stalk-up while fully
+engaged still only cancels speed control.
+---
+ .../sunnypilot/car/rivian/carstate_ext.py     |  35 ++-
+ .../sunnypilot/car/rivian/tests/__init__.py   |   0
+ .../car/rivian/tests/test_carstate_ext.py     |  69 ++++++
+ .../steering_sub_layouts/mads_settings.py     |  27 +-
+ openpilot/sunnypilot/mads/helpers.py          |   9 +-
+ .../mads/tests/test_mads_steering_mode.py     |  22 +-
+ .../sunnypilot/selfdrive/car/car_specific.py  |  36 +++
+ .../car/tests/test_car_specific_rivian.py     | 231 ++++++++++++++++++
+ .../sunnypilot/sunnylink/settings_ui.json     |  52 ++--
+ .../sunnylink/settings_ui_src/_macros.yaml    |  15 +-
+ .../settings_ui_src/pages/steering.yaml       |   4 +-
+ 11 files changed, 438 insertions(+), 62 deletions(-)
+ create mode 100644 opendbc_repo/opendbc/sunnypilot/car/rivian/tests/__init__.py
+ create mode 100644 opendbc_repo/opendbc/sunnypilot/car/rivian/tests/test_carstate_ext.py
+ create mode 100644 openpilot/sunnypilot/selfdrive/car/tests/test_car_specific_rivian.py
+
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/rivian/carstate_ext.py b/opendbc_repo/opendbc/sunnypilot/car/rivian/carstate_ext.py
+index 54a616f20..0e422b9da 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/rivian/carstate_ext.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/rivian/carstate_ext.py
+@@ -30,11 +30,32 @@ class CarStateExt:
+     self.distance_button = 0
+     self.increase_counter = 0
+     self.decrease_counter = 0
+-
+-  def update_longitudinal_upgrade(self, ret: structs.CarState, can_parsers: dict[StrEnum, CANParser]) -> None:
++    self.stalk_up = False
++    self.stalk_up2 = False
++
++  def update_stalk(self, can_parsers: dict[StrEnum, CANParser]) -> list[structs.CarState.ButtonEvent]:
++    # VDM_UserAdasRequest: 0=IDLE, 1=UP_1, 2=UP_2, 3=DOWN_1, 4=DOWN_2
++    # Stalk up is the native ACC cancel, reported as cancel for as long as it is held in UP_1 or UP_2,
++    # so moving between UP_1 and UP_2 is not a new press. UP_2 (past the detent) is reported as altButton2.
++    stalk = int(can_parsers[Bus.pt].vl["VDM_AdasSts"]["VDM_UserAdasRequest"])
++    stalk_up = stalk in (1, 2)
++    stalk_up2 = stalk == 2
++
++    button_events = []
++    if stalk_up != self.stalk_up:
++      button_events.append(structs.CarState.ButtonEvent(pressed=stalk_up, type=ButtonType.cancel))
++    if stalk_up2 != self.stalk_up2:
++      button_events.append(structs.CarState.ButtonEvent(pressed=stalk_up2, type=ButtonType.altButton2))
++
++    self.stalk_up = stalk_up
++    self.stalk_up2 = stalk_up2
++    return button_events
++
++  def update_longitudinal_upgrade(self, ret: structs.CarState, can_parsers: dict[StrEnum, CANParser]) -> list[structs.CarState.ButtonEvent]:
+     cp_park = can_parsers[Bus.alt]
+     cp_adas = can_parsers[Bus.adas]
+     cp = can_parsers[Bus.pt]
++    button_events = []
+ 
+     prev_increase_button = self.increase_button
+     prev_decrease_button = self.decrease_button
+@@ -44,7 +65,7 @@ class CarStateExt:
+       right_scroll = cp_park.vl["WheelButtons_Fwd"]["RightButton_Scroll"]
+       if right_scroll != 255:
+         if self.distance_button != right_scroll:
+-          ret.buttonEvents = [structs.CarState.ButtonEvent(pressed=False, type=ButtonType.gapAdjustCruise)]
++          button_events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.gapAdjustCruise))
+         self.distance_button = right_scroll
+ 
+       # button logic for set-speed
+@@ -87,9 +108,15 @@ class CarStateExt:
+       ret.leftBlindspot = cp_park.vl["BSM_BlindSpotIndicator_Fwd"]["BSM_BlindSpotIndicator_Left"] != 0
+       ret.rightBlindspot = cp_park.vl["BSM_BlindSpotIndicator_Fwd"]["BSM_BlindSpotIndicator_Right"] != 0
+ 
++    return button_events
++
+   def update(self, ret: structs.CarState, can_parsers: dict[StrEnum, CANParser]) -> None:
++    button_events = []
+     if self.CP_SP.flags & RivianFlagsSP.LONGITUDINAL_HARNESS_UPGRADE:
+-      self.update_longitudinal_upgrade(ret, can_parsers)
++      button_events += self.update_longitudinal_upgrade(ret, can_parsers)
++
++    # collect into one list and assign once: re-reading ret.buttonEvents and reassigning orphans the old capnp list
++    ret.buttonEvents = button_events + self.update_stalk(can_parsers)
+ 
+   @staticmethod
+   def get_parser(CP, CP_SP) -> dict[StrEnum, CANParser]:
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/rivian/tests/__init__.py b/opendbc_repo/opendbc/sunnypilot/car/rivian/tests/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/rivian/tests/test_carstate_ext.py b/opendbc_repo/opendbc/sunnypilot/car/rivian/tests/test_carstate_ext.py
+new file mode 100644
+index 000000000..349df1567
+--- /dev/null
++++ b/opendbc_repo/opendbc/sunnypilot/car/rivian/tests/test_carstate_ext.py
+@@ -0,0 +1,69 @@
++import unittest
++
++from opendbc.car import Bus, structs
++from opendbc.sunnypilot.car.rivian.carstate_ext import CarStateExt
++from opendbc.sunnypilot.car.rivian.values import RivianFlagsSP
++
++ButtonType = structs.CarState.ButtonEvent.Type
++
++IDLE, UP_1, UP_2, DOWN_1 = 0, 1, 2, 3
++
++
++class FakeParser:
++  def __init__(self):
++    self.vl = {
++      "VDM_AdasSts": {"VDM_UserAdasRequest": IDLE},
++      "WheelButtons_Fwd": {"RightButton_Scroll": 0, "RightButton_RightClick": 0, "RightButton_LeftClick": 0},
++      "Cluster": {"Cluster_Unit": 1},
++    }
++
++
++class TestRivianStalk(unittest.TestCase):
++  def setUp(self):
++    CP = structs.CarParams()
++    CP.brand = "rivian"
++    self.cs = CarStateExt(CP, structs.CarParamsSP())
++    self.parser = FakeParser()
++
++  def _stalk(self, position):
++    self.parser.vl["VDM_AdasSts"]["VDM_UserAdasRequest"] = position
++    return [(be.type, be.pressed) for be in self.cs.update_stalk({Bus.pt: self.parser})]
++
++  def test_stalk_positions(self):
++    steps = [
++      (UP_1, [(ButtonType.cancel, True)]),
++      (UP_1, []),
++      # UP_1 to UP_2 and back is the same held press, so no new cancel press
++      (UP_2, [(ButtonType.altButton2, True)]),
++      (UP_2, []),
++      (UP_1, [(ButtonType.altButton2, False)]),
++      (IDLE, [(ButtonType.cancel, False)]),
++      # a flick straight to UP_2 in one frame
++      (UP_2, [(ButtonType.cancel, True), (ButtonType.altButton2, True)]),
++      (IDLE, [(ButtonType.cancel, False), (ButtonType.altButton2, False)]),
++      (DOWN_1, []),
++      (UP_1, [(ButtonType.cancel, True)]),
++    ]
++    for position, expected in steps:
++      with self.subTest(position=position):
++        self.assertEqual(self._stalk(position), expected)
++
++  def test_stalk_and_distance_events_in_one_frame(self):
++    CP = structs.CarParams()
++    CP.brand = "rivian"
++    CP.openpilotLongitudinalControl = True
++    CP_SP = structs.CarParamsSP()
++    CP_SP.flags = RivianFlagsSP.LONGITUDINAL_HARNESS_UPGRADE.value
++    cs = CarStateExt(CP, CP_SP)
++    parsers = {Bus.pt: self.parser, Bus.adas: self.parser, Bus.alt: self.parser}
++
++    self.parser.vl["WheelButtons_Fwd"]["RightButton_Scroll"] = 1
++    self.parser.vl["VDM_AdasSts"]["VDM_UserAdasRequest"] = UP_2
++    ret = structs.CarState()
++    cs.update(ret, parsers)
++    self.assertEqual([(be.type, be.pressed) for be in ret.buttonEvents],
++                     [(ButtonType.gapAdjustCruise, False), (ButtonType.cancel, True), (ButtonType.altButton2, True)])
++
++
++if __name__ == "__main__":
++  unittest.main()
+diff --git a/openpilot/selfdrive/ui/sunnypilot/layouts/settings/steering_sub_layouts/mads_settings.py b/openpilot/selfdrive/ui/sunnypilot/layouts/settings/steering_sub_layouts/mads_settings.py
+index 4cde48995..306dfff04 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/layouts/settings/steering_sub_layouts/mads_settings.py
++++ b/openpilot/selfdrive/ui/sunnypilot/layouts/settings/steering_sub_layouts/mads_settings.py
+@@ -84,7 +84,7 @@ class MadsSettingsLayout(Widget):
+     self._scroller.show_event()
+ 
+   @staticmethod
+-  def _mads_limited_settings() -> bool:
++  def _get_brand() -> str:
+     brand = ""
+     if ui_state.is_offroad():
+       bundle = ui_state.params.get("CarPlatformBundle")
+@@ -92,10 +92,13 @@ class MadsSettingsLayout(Widget):
+         brand = bundle.get("brand", "")
+     if not brand:
+       brand = ui_state.CP.brand if ui_state.CP is not None else ""
++    return brand
++
++  @staticmethod
++  def _mads_limited_settings() -> bool:
++    brand = MadsSettingsLayout._get_brand()
+ 
+-    if brand == "rivian":
+-      return True
+-    elif brand == "tesla":
++    if brand == "tesla":
+       if ui_state.CP_SP is None or not ui_state.CP_SP.flags & TeslaFlagsSP.HAS_VEHICLE_BUS:
+         return True
+       screen_button = int(ui_state.params.get("TeslaMadsScreenButton", return_default=True))
+@@ -113,10 +116,11 @@ class MadsSettingsLayout(Widget):
+ 
+   def _update_toggles(self):
+     self._update_steering_mode_description(self._steering_mode.action_item.get_selected_button())
+-    if self._mads_limited_settings():
++    limited = self._mads_limited_settings()
++    # Rivian has no MADS button, so UEM stays on and Main Cruise stays off, but every steering mode on brake applies
++    if limited or self._get_brand() == "rivian":
+       ui_state.params.remove("MadsMainCruiseAllowed")
+       ui_state.params.put_bool("MadsUnifiedEngagementMode", True)
+-      ui_state.params.put("MadsSteeringMode", MadsSteeringModeOnBrake.DISENGAGE)
+ 
+       self._main_cruise_toggle.action_item.set_enabled(False)
+       self._main_cruise_toggle.action_item.set_state(False)
+@@ -125,10 +129,6 @@ class MadsSettingsLayout(Widget):
+       self._unified_engagement_toggle.action_item.set_enabled(False)
+       self._unified_engagement_toggle.action_item.set_state(True)
+       self._unified_engagement_toggle.set_description("<b>" + DEFAULT_TO_ON + "</b><br>" + MADS_UNIFIED_ENGAGEMENT_MODE_BASE_DESC)
+-
+-      self._steering_mode.set_description(STATUS_DISENGAGE_ONLY)
+-      self._steering_mode.action_item.set_selected_button(MadsSteeringModeOnBrake.DISENGAGE)
+-      self._steering_mode.action_item.set_enabled_buttons({MadsSteeringModeOnBrake.DISENGAGE})
+     else:
+       self._main_cruise_toggle.action_item.set_enabled(True)
+       self._main_cruise_toggle.set_description(MADS_MAIN_CRUISE_BASE_DESC)
+@@ -136,5 +136,12 @@ class MadsSettingsLayout(Widget):
+       self._unified_engagement_toggle.action_item.set_enabled(True)
+       self._unified_engagement_toggle.set_description(MADS_UNIFIED_ENGAGEMENT_MODE_BASE_DESC)
+ 
++    if limited:
++      ui_state.params.put("MadsSteeringMode", MadsSteeringModeOnBrake.DISENGAGE)
++
++      self._steering_mode.set_description(STATUS_DISENGAGE_ONLY)
++      self._steering_mode.action_item.set_selected_button(MadsSteeringModeOnBrake.DISENGAGE)
++      self._steering_mode.action_item.set_enabled_buttons({MadsSteeringModeOnBrake.DISENGAGE})
++    else:
+       self._steering_mode.action_item.set_enabled(True)
+       self._steering_mode.action_item.set_enabled_buttons(None)
+diff --git a/openpilot/sunnypilot/mads/helpers.py b/openpilot/sunnypilot/mads/helpers.py
+index 655d7bc9a..d40a8124b 100644
+--- a/openpilot/sunnypilot/mads/helpers.py
++++ b/openpilot/sunnypilot/mads/helpers.py
+@@ -22,8 +22,8 @@ class MadsSteeringModeOnBrake:
+ 
+ 
+ def get_mads_limited_brands(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params: Params) -> bool:
+-  if CP.brand == 'rivian':
+-    return True
++  # Rivian is not limited: the stalk (UP_1 with ACC off, UP_2) and park/reverse give it
++  # consistent MADS exits, see CarSpecificEventsSP, so every steering mode on brake applies.
+   if CP.brand == 'tesla':
+     if not CP_SP.flags & TeslaFlagsSP.HAS_VEHICLE_BUS:
+       return True
+@@ -65,11 +65,14 @@ def set_car_specific_params(CP: structs.CarParams, CP_SP: structs.CarParamsSP, p
+   # MADS Partial Support
+   # MADS is currently partially supported for these platforms due to lack of consistent states to engage controls
+   # Only MadsSteeringModeOnBrake.DISENGAGE is supported for these platforms
+-  # TODO-SP: To enable MADS full support for Rivian and most Tesla, identify consistent signals for MADS toggling
++  # TODO-SP: To enable MADS full support for most Tesla, identify consistent signals for MADS toggling
+   mads_partial_support = get_mads_limited_brands(CP, CP_SP, params)
+   if mads_partial_support:
+     params.put("MadsSteeringMode", 2, block=True)
+     params.put_bool("MadsUnifiedEngagementMode", True, block=True)
++  elif CP.brand == "rivian":
++    # no MADS button: lateral can only engage together with ACC
++    params.put_bool("MadsUnifiedEngagementMode", True, block=True)
+ 
+   # no ACC MAIN button for these brands
+   if CP.brand in MADS_NO_ACC_MAIN_BUTTON:
+diff --git a/openpilot/sunnypilot/mads/tests/test_mads_steering_mode.py b/openpilot/sunnypilot/mads/tests/test_mads_steering_mode.py
+index 2058a8b10..d5b941d51 100644
+--- a/openpilot/sunnypilot/mads/tests/test_mads_steering_mode.py
++++ b/openpilot/sunnypilot/mads/tests/test_mads_steering_mode.py
+@@ -11,7 +11,7 @@ from openpilot.cereal import log, custom
+ from opendbc.car import structs
+ from openpilot.selfdrive.selfdrived.events import Events
+ from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
+-from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, read_steering_mode_param
++from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, read_steering_mode_param, set_car_specific_params
+ from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
+ from opendbc.sunnypilot.car.tesla.values import MadsScreenButtonType, TeslaFlagsSP
+ from openpilot.common.test import OpenpilotTestCase
+@@ -214,13 +214,25 @@ class TestLateralMismatchCounter(OpenpilotTestCase):
+ # brand restrictions
+ 
+ class TestBrandSteeringModeRestrictions(OpenpilotTestCase):
+-  def test_rivian_forced_to_disengage(self, mocker):
++  @parameterized.expand([MadsSteeringModeOnBrake.REMAIN_ACTIVE,
++                         MadsSteeringModeOnBrake.PAUSE,
++                         MadsSteeringModeOnBrake.DISENGAGE], names=["steering_mode"])
++  def test_rivian_uses_param(self, mocker, steering_mode):
+     CP = structs.CarParams()
+     CP.brand = "rivian"
+     CP_SP = structs.CarParamsSP()
+-    params = mocker.MagicMock()
+-    assert read_steering_mode_param(CP, CP_SP, params) == MadsSteeringModeOnBrake.DISENGAGE
+-    params.get.assert_not_called()
++    params = make_params_mock(mocker, {"MadsSteeringMode": steering_mode})
++    assert read_steering_mode_param(CP, CP_SP, params) == steering_mode
++
++  def test_rivian_car_params_keep_steering_mode_and_force_uem(self, mocker):
++    CP = structs.CarParams()
++    CP.brand = "rivian"
++    CP_SP = structs.CarParamsSP()
++    params = make_params_mock(mocker, {"MadsSteeringMode": MadsSteeringModeOnBrake.REMAIN_ACTIVE})
++    set_car_specific_params(CP, CP_SP, params)
++    params.put.assert_not_called()
++    params.put_bool.assert_called_once_with("MadsUnifiedEngagementMode", True, block=True)
++    params.remove.assert_called_once_with("MadsMainCruiseAllowed")
+ 
+   def test_tesla_without_vehicle_bus_forced_to_disengage(self, mocker):
+     CP = structs.CarParams()
+diff --git a/openpilot/sunnypilot/selfdrive/car/car_specific.py b/openpilot/sunnypilot/selfdrive/car/car_specific.py
+index 54fcd3497..de9dd9550 100644
+--- a/openpilot/sunnypilot/selfdrive/car/car_specific.py
++++ b/openpilot/sunnypilot/selfdrive/car/car_specific.py
+@@ -14,8 +14,11 @@ from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
+ 
+ EventName = log.OnroadEvent.EventName
+ EventNameSP = custom.OnroadEventSP.EventName
++ButtonType = structs.CarState.ButtonEvent.Type
+ GearShifter = structs.CarState.GearShifter
+ 
++RIVIAN_MADS_EXIT_GEARS = (GearShifter.park, GearShifter.reverse)
++
+ 
+ class CarSpecificEventsSP:
+   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP):
+@@ -23,6 +26,9 @@ class CarSpecificEventsSP:
+     self.CP_SP = CP_SP
+ 
+     self.low_speed_alert = False
++    self.rivian_stalk_up2 = False
++    self.rivian_prev_gear = GearShifter.unknown
++    self.rivian_gear_exit_frames = 0
+ 
+   def update(self, CS: structs.CarState, events: Events):
+     events_sp = EventsSP()
+@@ -48,4 +54,34 @@ class CarSpecificEventsSP:
+           if events.has(EventName.resumeRequired):
+             events.remove(EventName.resumeRequired)
+ 
++    elif self.CP.brand == 'rivian':
++      # Rivian has no MADS button, so the stalk and the gear selector end MADS steering fully (not pause)
++      for be in CS.buttonEvents:
++        if be.type == ButtonType.altButton2:
++          # stalk UP_2 (past the detent) ends everything
++          self.rivian_stalk_up2 = be.pressed
++          if be.pressed:
++            events_sp.add(EventNameSP.lkasDisable)
++        elif be.type == ButtonType.cancel and be.pressed and not CS.cruiseState.enabled:
++          # a new stalk up press that starts with speed control already off ends steering. One press while
++          # fully engaged only cancels speed control natively, and holding it through that cancel is not a new press
++          events_sp.add(EventNameSP.lkasDisable)
++
++      # Shifting into park or reverse ends steering. On the shift frame mads.update_events() also adds
++      # silentLkasDisable for wrongGear/reverseGear, which wins and pauses MADS, so send lkasDisable
++      # again on the next frame, when it alone takes MADS from paused to disabled.
++      if CS.gearShifter in RIVIAN_MADS_EXIT_GEARS:
++        if CS.gearShifter != self.rivian_prev_gear:
++          self.rivian_gear_exit_frames = 2
++      else:
++        self.rivian_gear_exit_frames = 0
++      if self.rivian_gear_exit_frames > 0:
++        events_sp.add(EventNameSP.lkasDisable)
++        self.rivian_gear_exit_frames -= 1
++      self.rivian_prev_gear = CS.gearShifter
++
++      # no engagement while the stalk is held past the detent or in park
++      if self.rivian_stalk_up2 or CS.gearShifter == GearShifter.park:
++        events.remove(EventName.pcmEnable)
++
+     return events_sp
+diff --git a/openpilot/sunnypilot/selfdrive/car/tests/test_car_specific_rivian.py b/openpilot/sunnypilot/selfdrive/car/tests/test_car_specific_rivian.py
+new file mode 100644
+index 000000000..217ee1336
+--- /dev/null
++++ b/openpilot/sunnypilot/selfdrive/car/tests/test_car_specific_rivian.py
+@@ -0,0 +1,231 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++"""
++
++from openpilot.common.parameterized import parameterized
++
++from openpilot.cereal import log, custom
++from opendbc.car import structs
++from openpilot.selfdrive.selfdrived.events import Events
++from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
++from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake
++from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
++from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
++from openpilot.common.test import OpenpilotTestCase
++
++State = custom.ModularAssistiveDrivingSystem.ModularAssistiveDrivingSystemState
++EventName = log.OnroadEvent.EventName
++EventNameSP = custom.OnroadEventSP.EventName
++ButtonType = structs.CarState.ButtonEvent.Type
++GearShifter = structs.CarState.GearShifter
++SafetyModel = structs.CarParams.SafetyModel
++
++UP_PRESS = ((ButtonType.cancel, True),)
++UP_RELEASE = ((ButtonType.cancel, False),)
++UP_2_PRESS = ((ButtonType.cancel, True), (ButtonType.altButton2, True))
++UP_2_RELEASE = ((ButtonType.cancel, False), (ButtonType.altButton2, False))
++
++
++def make_car_state(gear=GearShifter.drive, acc=False, buttons=(), brake_pressed=False, v_ego=10.0):
++  cs = structs.CarState()
++  cs.gearShifter = gear
++  cs.cruiseState.enabled = acc
++  cs.cruiseState.available = True
++  cs.buttonEvents = [structs.CarState.ButtonEvent(type=t, pressed=p) for t, p in buttons]
++  cs.brakePressed = brake_pressed
++  cs.vEgo = v_ego
++  cs.standstill = v_ego < 0.01
++  return cs
++
++
++def make_car_specific():
++  CP = structs.CarParams()
++  CP.brand = "rivian"
++  return CarSpecificEventsSP(CP, structs.CarParamsSP())
++
++
++def car_specific_step(car_specific, cs, event_names=()):
++  events = Events()
++  for name in event_names:
++    events.add(name)
++  events_sp = car_specific.update(cs, events)
++  return events, events_sp
++
++
++class TestRivianMadsExitEvents(OpenpilotTestCase):
++  def test_up2_disengages_and_blocks_pcm_enable_while_held(self):
++    car_specific = make_car_specific()
++
++    events, events_sp = car_specific_step(car_specific, make_car_state(acc=True, buttons=UP_2_PRESS), [EventName.pcmEnable])
++    assert events_sp.has(EventNameSP.lkasDisable)
++    assert not events.has(EventName.pcmEnable)
++
++    events, events_sp = car_specific_step(car_specific, make_car_state(), [EventName.pcmEnable])
++    assert not events_sp.has(EventNameSP.lkasDisable)
++    assert not events.has(EventName.pcmEnable)
++
++    events, events_sp = car_specific_step(car_specific, make_car_state(buttons=UP_2_RELEASE), [EventName.pcmEnable])
++    assert not events_sp.has(EventNameSP.lkasDisable)
++    assert events.has(EventName.pcmEnable)
++
++  def test_up_press_with_speed_control_off_disengages(self):
++    _, events_sp = car_specific_step(make_car_specific(), make_car_state(acc=False, buttons=UP_PRESS))
++    assert events_sp.has(EventNameSP.lkasDisable)
++
++  def test_up_press_while_fully_engaged_only_cancels_speed_control(self):
++    car_specific = make_car_specific()
++
++    _, events_sp = car_specific_step(car_specific, make_car_state(acc=True, buttons=UP_PRESS))
++    assert not events_sp.has(EventNameSP.lkasDisable)
++
++    # still holding the stalk after the ACM drops ACC is the same press
++    for _ in range(50):
++      _, events_sp = car_specific_step(car_specific, make_car_state(acc=False))
++      assert not events_sp.has(EventNameSP.lkasDisable)
++
++    _, events_sp = car_specific_step(car_specific, make_car_state(acc=False, buttons=UP_RELEASE))
++    assert not events_sp.has(EventNameSP.lkasDisable)
++
++    # the next press starts with speed control off
++    _, events_sp = car_specific_step(car_specific, make_car_state(acc=False, buttons=UP_PRESS))
++    assert events_sp.has(EventNameSP.lkasDisable)
++
++  @parameterized.expand([GearShifter.park, GearShifter.reverse], names=["gear"])
++  def test_gear_entry_disengages_on_two_frames(self, gear):
++    car_specific = make_car_specific()
++    _, events_sp = car_specific_step(car_specific, make_car_state(v_ego=0.0))
++    assert not events_sp.has(EventNameSP.lkasDisable)
++
++    for _ in range(2):
++      _, events_sp = car_specific_step(car_specific, make_car_state(gear=gear, v_ego=0.0))
++      assert events_sp.has(EventNameSP.lkasDisable)
++
++    _, events_sp = car_specific_step(car_specific, make_car_state(gear=gear, v_ego=0.0))
++    assert not events_sp.has(EventNameSP.lkasDisable)
++
++  def test_park_to_reverse_disengages_again(self):
++    car_specific = make_car_specific()
++    for _ in range(3):
++      car_specific_step(car_specific, make_car_state(gear=GearShifter.park, v_ego=0.0))
++    _, events_sp = car_specific_step(car_specific, make_car_state(gear=GearShifter.reverse, v_ego=0.0))
++    assert events_sp.has(EventNameSP.lkasDisable)
++
++  def test_pcm_enable_blocked_in_park(self):
++    events, _ = car_specific_step(make_car_specific(), make_car_state(gear=GearShifter.park, v_ego=0.0), [EventName.pcmEnable])
++    assert not events.has(EventName.pcmEnable)
++
++  def test_driving_with_brake_adds_nothing(self):
++    car_specific = make_car_specific()
++    for acc in (True, False):
++      events, events_sp = car_specific_step(car_specific, make_car_state(acc=acc, brake_pressed=True), [EventName.pcmEnable])
++      assert not events_sp.has(EventNameSP.lkasDisable)
++      assert events.has(EventName.pcmEnable)
++
++
++# end to end through the MADS state machine, with the brake mode read from the param as on the car
++
++def make_panda_state(mocker):
++  ps = mocker.MagicMock()
++  ps.controlsAllowedLateral = True
++  ps.safetyModel = SafetyModel.rivian
++  return ps
++
++
++def make_rivian_mads(mocker, steering_mode=MadsSteeringModeOnBrake.REMAIN_ACTIVE):
++  sd = mocker.MagicMock()
++  sd.CP = structs.CarParams()
++  sd.CP.brand = "rivian"
++  sd.CP_SP = structs.CarParamsSP()
++  sd.params = mocker.MagicMock()
++  sd.params.get_bool = mocker.MagicMock(side_effect=lambda k: {
++    "Mads": True, "MadsMainCruiseAllowed": False,
++    "DisengageOnAccelerator": False, "MadsUnifiedEngagementMode": True,
++  }.get(k, False))
++  sd.params.get = mocker.MagicMock(return_value=steering_mode)
++  sd.events = Events()
++  sd.events_sp = EventsSP()
++  sd.enabled = False
++  sd.enabled_prev = False
++  sd.initialized = True
++  sd.CS_prev = make_car_state()
++  sd.sm = {'pandaStates': [make_panda_state(mocker)]}
++  sd.state_machine = mocker.MagicMock()
++
++  mads = ModularAssistiveDrivingSystem(sd)
++  mads.state_machine.state = State.enabled
++  mads.enabled = True
++  mads.active = True
++  return mads, sd
++
++
++def run_frame(car_specific, mads, sd, cs, event_names=(), selfdrive_enabled=False):
++  # same order as selfdrived: car events, car specific events, then MADS
++  sd.enabled = selfdrive_enabled
++  for name in event_names:
++    sd.events.add(name)
++  sd.events_sp.add_from_msg(car_specific.update(cs, sd.events).to_msg())
++  mads.update(cs)
++  sd.CS_prev = cs
++  sd.events.clear()
++  sd.events_sp.clear()
++
++
++class TestRivianMadsExits(OpenpilotTestCase):
++  def test_brake_keeps_steering_in_remain_active(self, mocker):
++    mads, sd = make_rivian_mads(mocker)
++    assert mads.steering_mode_on_brake == MadsSteeringModeOnBrake.REMAIN_ACTIVE
++    car_specific = make_car_specific()
++
++    run_frame(car_specific, mads, sd, make_car_state(acc=False, brake_pressed=True), [EventName.pedalPressed, EventName.pcmDisable])
++    for _ in range(100):
++      run_frame(car_specific, mads, sd, make_car_state(acc=False, brake_pressed=True, v_ego=0.0), [EventName.pcmDisable])
++    assert mads.state_machine.state == State.enabled
++
++  def test_brake_still_disengages_in_disengage_mode(self, mocker):
++    mads, sd = make_rivian_mads(mocker, MadsSteeringModeOnBrake.DISENGAGE)
++    run_frame(make_car_specific(), mads, sd, make_car_state(acc=False, brake_pressed=True), [EventName.pedalPressed])
++    assert mads.state_machine.state == State.disabled
++
++  def test_up_press_after_speed_control_off_ends_steering(self, mocker):
++    mads, sd = make_rivian_mads(mocker)
++    run_frame(make_car_specific(), mads, sd, make_car_state(acc=False, buttons=UP_PRESS), [EventName.pcmDisable])
++    assert mads.state_machine.state == State.disabled
++
++  def test_one_up_press_never_ends_both(self, mocker):
++    mads, sd = make_rivian_mads(mocker)
++    car_specific = make_car_specific()
++
++    # fully engaged: the press cancels speed control (natively and through buttonCancel), steering stays
++    run_frame(car_specific, mads, sd, make_car_state(acc=True, buttons=UP_PRESS), [EventName.buttonCancel], selfdrive_enabled=True)
++    for _ in range(20):
++      run_frame(car_specific, mads, sd, make_car_state(acc=False), [EventName.pcmDisable])
++    run_frame(car_specific, mads, sd, make_car_state(acc=False, buttons=UP_RELEASE), [EventName.pcmDisable, EventName.buttonCancel])
++    assert mads.state_machine.state == State.enabled
++
++    # a second press ends steering
++    run_frame(car_specific, mads, sd, make_car_state(acc=False, buttons=UP_PRESS), [EventName.pcmDisable, EventName.buttonCancel])
++    assert mads.state_machine.state == State.disabled
++
++  def test_up2_ends_everything(self, mocker):
++    mads, sd = make_rivian_mads(mocker)
++    run_frame(make_car_specific(), mads, sd, make_car_state(acc=True, buttons=UP_2_PRESS), [EventName.buttonCancel], selfdrive_enabled=True)
++    assert mads.state_machine.state == State.disabled
++
++  @parameterized.expand([(GearShifter.park, (EventName.wrongGear,)),
++                         (GearShifter.reverse, (EventName.wrongGear, EventName.reverseGear))], names=["gear", "gear_events"])
++  def test_gear_entry_ends_steering_instead_of_pausing(self, mocker, gear, gear_events):
++    mads, sd = make_rivian_mads(mocker)
++    car_specific = make_car_specific()
++    run_frame(car_specific, mads, sd, make_car_state(acc=False, brake_pressed=True, v_ego=0.0), [EventName.pcmDisable])
++
++    for _ in range(10):
++      run_frame(car_specific, mads, sd, make_car_state(gear=gear, acc=False, brake_pressed=True, v_ego=0.0),
++                [EventName.pcmDisable, *gear_events])
++    assert mads.state_machine.state == State.disabled
++
++    # shifting back to drive does not bring steering back
++    run_frame(car_specific, mads, sd, make_car_state(acc=False, v_ego=0.0), [EventName.pcmDisable])
++    assert mads.state_machine.state == State.disabled
+diff --git a/openpilot/sunnypilot/sunnylink/settings_ui.json b/openpilot/sunnypilot/sunnylink/settings_ui.json
+index 63bf342fc..097b8fbee 100644
+--- a/openpilot/sunnypilot/sunnylink/settings_ui.json
++++ b/openpilot/sunnypilot/sunnylink/settings_ui.json
+@@ -135,30 +135,20 @@
+                         {
+                           "type": "not",
+                           "condition": {
+-                            "type": "any",
++                            "type": "all",
+                             "conditions": [
+                               {
+                                 "type": "capability",
+                                 "field": "brand",
+-                                "equals": "rivian"
++                                "equals": "tesla"
+                               },
+                               {
+-                                "type": "all",
+-                                "conditions": [
+-                                  {
+-                                    "type": "capability",
+-                                    "field": "brand",
+-                                    "equals": "tesla"
+-                                  },
+-                                  {
+-                                    "type": "not",
+-                                    "condition": {
+-                                      "type": "capability",
+-                                      "field": "tesla_has_vehicle_bus",
+-                                      "equals": true
+-                                    }
+-                                  }
+-                                ]
++                                "type": "not",
++                                "condition": {
++                                  "type": "capability",
++                                  "field": "tesla_has_vehicle_bus",
++                                  "equals": true
++                                }
+                               }
+                             ]
+                           }
+@@ -172,30 +162,20 @@
+                         {
+                           "type": "not",
+                           "condition": {
+-                            "type": "any",
++                            "type": "all",
+                             "conditions": [
+                               {
+                                 "type": "capability",
+                                 "field": "brand",
+-                                "equals": "rivian"
++                                "equals": "tesla"
+                               },
+                               {
+-                                "type": "all",
+-                                "conditions": [
+-                                  {
+-                                    "type": "capability",
+-                                    "field": "brand",
+-                                    "equals": "tesla"
+-                                  },
+-                                  {
+-                                    "type": "not",
+-                                    "condition": {
+-                                      "type": "capability",
+-                                      "field": "tesla_has_vehicle_bus",
+-                                      "equals": true
+-                                    }
+-                                  }
+-                                ]
++                                "type": "not",
++                                "condition": {
++                                  "type": "capability",
++                                  "field": "tesla_has_vehicle_bus",
++                                  "equals": true
++                                }
+                               }
+                             ]
+                           }
+diff --git a/openpilot/sunnypilot/sunnylink/settings_ui_src/_macros.yaml b/openpilot/sunnypilot/sunnylink/settings_ui_src/_macros.yaml
+index a77172083..d5c4815ee 100644
+--- a/openpilot/sunnypilot/sunnylink/settings_ui_src/_macros.yaml
++++ b/openpilot/sunnypilot/sunnylink/settings_ui_src/_macros.yaml
+@@ -31,8 +31,8 @@ macros:
+     - type: not
+       condition: {type: capability, field: device_type, equals: mici}
+ 
+-  # Mirrors selfdrive/ui/sunnypilot/layouts/.../mads_settings.py:_mads_limited_settings()
+-  # Rivian + Tesla-without-vehicle-bus get the limited MADS UI (3-toggle subset).
++  # Mirrors selfdrive/ui/sunnypilot/layouts/.../mads_settings.py:_update_toggles()
++  # Rivian + Tesla-without-vehicle-bus get Main Cruise/UEM locked (Rivian: no MADS button).
+   # On those platforms these toggles are disabled — full MADS settings are
+   # only writable on platforms NOT in the limited-set.
+   mads_full_platforms:
+@@ -47,6 +47,17 @@ macros:
+               - type: not
+                 condition: {type: capability, field: tesla_has_vehicle_bus, equals: true}
+ 
++  # Like mads_full_platforms but does not exclude Rivian — Rivian supports all
++  # three MadsSteeringMode options (only Tesla-no-bus is limited to Disengage).
++  mads_steering_full_platforms:
++    - type: not
++      condition:
++        type: all
++        conditions:
++          - {type: capability, field: brand, equals: tesla}
++          - type: not
++            condition: {type: capability, field: tesla_has_vehicle_bus, equals: true}
++
+   # Inverse of mads_full_platforms: present only on the limited platforms.
+   # Useful for "show this only on rivian/tesla-no-bus" toggles.
+   mads_limited_platforms:
+diff --git a/openpilot/sunnypilot/sunnylink/settings_ui_src/pages/steering.yaml b/openpilot/sunnypilot/sunnylink/settings_ui_src/pages/steering.yaml
+index 73d46681a..6774e69c9 100644
+--- a/openpilot/sunnypilot/sunnylink/settings_ui_src/pages/steering.yaml
++++ b/openpilot/sunnypilot/sunnylink/settings_ui_src/pages/steering.yaml
+@@ -49,11 +49,11 @@ sections:
+       - value: 0
+         label: Remain Active
+         enablement:
+-        - $ref: '#/macros/mads_full_platforms'
++        - $ref: '#/macros/mads_steering_full_platforms'
+       - value: 1
+         label: Pause
+         enablement:
+-        - $ref: '#/macros/mads_full_platforms'
++        - $ref: '#/macros/mads_steering_full_platforms'
+       - value: 2
+         label: Disengage
+       enablement:
+-- 
+2.54.0 (Apple Git-157)
+
