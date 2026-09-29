@@ -11,7 +11,7 @@ from openpilot.cereal import log, custom
 from opendbc.car import structs
 from openpilot.selfdrive.selfdrived.events import Events
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
-from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, read_steering_mode_param
+from openpilot.sunnypilot.mads.helpers import MadsSteeringModeOnBrake, read_steering_mode_param, set_car_specific_params
 from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
 from opendbc.sunnypilot.car.tesla.values import MadsScreenButtonType, TeslaFlagsSP
 from openpilot.common.test import OpenpilotTestCase
@@ -214,13 +214,25 @@ class TestLateralMismatchCounter(OpenpilotTestCase):
 # brand restrictions
 
 class TestBrandSteeringModeRestrictions(OpenpilotTestCase):
-  def test_rivian_forced_to_disengage(self, mocker):
+  @parameterized.expand([MadsSteeringModeOnBrake.REMAIN_ACTIVE,
+                         MadsSteeringModeOnBrake.PAUSE,
+                         MadsSteeringModeOnBrake.DISENGAGE], names=["steering_mode"])
+  def test_rivian_uses_param(self, mocker, steering_mode):
     CP = structs.CarParams()
     CP.brand = "rivian"
     CP_SP = structs.CarParamsSP()
-    params = mocker.MagicMock()
-    assert read_steering_mode_param(CP, CP_SP, params) == MadsSteeringModeOnBrake.DISENGAGE
-    params.get.assert_not_called()
+    params = make_params_mock(mocker, {"MadsSteeringMode": steering_mode})
+    assert read_steering_mode_param(CP, CP_SP, params) == steering_mode
+
+  def test_rivian_car_params_keep_steering_mode_and_force_uem(self, mocker):
+    CP = structs.CarParams()
+    CP.brand = "rivian"
+    CP_SP = structs.CarParamsSP()
+    params = make_params_mock(mocker, {"MadsSteeringMode": MadsSteeringModeOnBrake.REMAIN_ACTIVE})
+    set_car_specific_params(CP, CP_SP, params)
+    params.put.assert_not_called()
+    params.put_bool.assert_called_once_with("MadsUnifiedEngagementMode", True, block=True)
+    params.remove.assert_called_once_with("MadsMainCruiseAllowed")
 
   def test_tesla_without_vehicle_bus_forced_to_disengage(self, mocker):
     CP = structs.CarParams()

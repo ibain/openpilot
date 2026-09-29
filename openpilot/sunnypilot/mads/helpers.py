@@ -22,8 +22,8 @@ class MadsSteeringModeOnBrake:
 
 
 def get_mads_limited_brands(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params: Params) -> bool:
-  if CP.brand == 'rivian':
-    return True
+  # Rivian is not limited: the stalk (UP_1 with ACC off, UP_2) and park/reverse give it
+  # consistent MADS exits, see CarSpecificEventsSP, so every steering mode on brake applies.
   if CP.brand == 'tesla':
     if not CP_SP.flags & TeslaFlagsSP.HAS_VEHICLE_BUS:
       return True
@@ -65,10 +65,13 @@ def set_car_specific_params(CP: structs.CarParams, CP_SP: structs.CarParamsSP, p
   # MADS Partial Support
   # MADS is currently partially supported for these platforms due to lack of consistent states to engage controls
   # Only MadsSteeringModeOnBrake.DISENGAGE is supported for these platforms
-  # TODO-SP: To enable MADS full support for Rivian and most Tesla, identify consistent signals for MADS toggling
+  # TODO-SP: To enable MADS full support for most Tesla, identify consistent signals for MADS toggling
   mads_partial_support = get_mads_limited_brands(CP, CP_SP, params)
   if mads_partial_support:
     params.put("MadsSteeringMode", 2, block=True)
+    params.put_bool("MadsUnifiedEngagementMode", True, block=True)
+  elif CP.brand == "rivian":
+    # no MADS button: lateral can only engage together with ACC
     params.put_bool("MadsUnifiedEngagementMode", True, block=True)
 
   # no ACC MAIN button for these brands

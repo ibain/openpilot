@@ -30,11 +30,32 @@ class CarStateExt:
     self.distance_button = 0
     self.increase_counter = 0
     self.decrease_counter = 0
+    self.stalk_up = False
+    self.stalk_up2 = False
 
-  def update_longitudinal_upgrade(self, ret: structs.CarState, can_parsers: dict[StrEnum, CANParser]) -> None:
+  def update_stalk(self, can_parsers: dict[StrEnum, CANParser]) -> list[structs.CarState.ButtonEvent]:
+    # VDM_UserAdasRequest: 0=IDLE, 1=UP_1, 2=UP_2, 3=DOWN_1, 4=DOWN_2
+    # Stalk up is the native ACC cancel, reported as cancel for as long as it is held in UP_1 or UP_2,
+    # so moving between UP_1 and UP_2 is not a new press. UP_2 (past the detent) is reported as altButton2.
+    stalk = int(can_parsers[Bus.pt].vl["VDM_AdasSts"]["VDM_UserAdasRequest"])
+    stalk_up = stalk in (1, 2)
+    stalk_up2 = stalk == 2
+
+    button_events = []
+    if stalk_up != self.stalk_up:
+      button_events.append(structs.CarState.ButtonEvent(pressed=stalk_up, type=ButtonType.cancel))
+    if stalk_up2 != self.stalk_up2:
+      button_events.append(structs.CarState.ButtonEvent(pressed=stalk_up2, type=ButtonType.altButton2))
+
+    self.stalk_up = stalk_up
+    self.stalk_up2 = stalk_up2
+    return button_events
+
+  def update_longitudinal_upgrade(self, ret: structs.CarState, can_parsers: dict[StrEnum, CANParser]) -> list[structs.CarState.ButtonEvent]:
     cp_park = can_parsers[Bus.alt]
     cp_adas = can_parsers[Bus.adas]
     cp = can_parsers[Bus.pt]
+    button_events = []
 
     prev_increase_button = self.increase_button
     prev_decrease_button = self.decrease_button
@@ -44,7 +65,7 @@ class CarStateExt:
       right_scroll = cp_park.vl["WheelButtons_Fwd"]["RightButton_Scroll"]
       if right_scroll != 255:
         if self.distance_button != right_scroll:
-          ret.buttonEvents = [structs.CarState.ButtonEvent(pressed=False, type=ButtonType.gapAdjustCruise)]
+          button_events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.gapAdjustCruise))
         self.distance_button = right_scroll
 
       # button logic for set-speed
@@ -87,9 +108,15 @@ class CarStateExt:
       ret.leftBlindspot = cp_park.vl["BSM_BlindSpotIndicator_Fwd"]["BSM_BlindSpotIndicator_Left"] != 0
       ret.rightBlindspot = cp_park.vl["BSM_BlindSpotIndicator_Fwd"]["BSM_BlindSpotIndicator_Right"] != 0
 
+    return button_events
+
   def update(self, ret: structs.CarState, can_parsers: dict[StrEnum, CANParser]) -> None:
+    button_events = []
     if self.CP_SP.flags & RivianFlagsSP.LONGITUDINAL_HARNESS_UPGRADE:
-      self.update_longitudinal_upgrade(ret, can_parsers)
+      button_events += self.update_longitudinal_upgrade(ret, can_parsers)
+
+    # collect into one list and assign once: re-reading ret.buttonEvents and reassigning orphans the old capnp list
+    ret.buttonEvents = button_events + self.update_stalk(can_parsers)
 
   @staticmethod
   def get_parser(CP, CP_SP) -> dict[StrEnum, CANParser]:
